@@ -268,9 +268,9 @@ def finetune(
             print(f'Saving checkpoint to {ckpt_path}')
 
         # Early stopping
-        if patience_counter >= patience:
-            print(f'Early stopping triggered after {patience} epochs without improvement')
-            break
+        # if patience_counter >= patience:
+        #     print(f'Early stopping triggered after {patience} epochs without improvement')
+        #     break
 
     return model
 
