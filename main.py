@@ -336,7 +336,7 @@ def main():
     if args.pretrain == None:
         train(args, datasets, model, output_dir = args.out_dir, output_prefix = args.prefix)
     else:
-        finetune(args, datasets, model, pretrained_path=args.pretrain output_dir = args.out_dir, output_prefix = args.prefix)
+        finetune(args, datasets, model, pretrained_path=args.pretrain, output_dir = args.out_dir, output_prefix = args.prefix)
 
 if __name__ == '__main__':
     main()
