@@ -311,6 +311,7 @@ def main():
     parser.add_argument('--use_amp', action = 'store_true', default = False, help = "whether to use torch.amp to acclerate training")
     parser.add_argument('--disable_random_seed', action = 'store_true', default = False, help = 'set random seed for reproducing')
     parser.add_argument('--random_seed', type = int, default = 30, help = 'set random seed for reproducing')
+    parser.add_argument('--pretrain', default=None, help = 'set random seed for reproducing')
 
     args = parser.parse_args()
     print(f'args: {vars(args)}')
@@ -332,7 +333,10 @@ def main():
     else:
         model = ClipCaptionModel(args.continuous_prompt_length, args.clip_project_length, clip_hidden_size, args.num_layers, gpt_type = args.language_model, soft_prompt_first = args.soft_prompt_first, only_hard_prompt = args.only_hard_prompt)
     
-    train(args, datasets, model, output_dir = args.out_dir, output_prefix = args.prefix)
+    if args.pretrain == None:
+        train(args, datasets, model, output_dir = args.out_dir, output_prefix = args.prefix)
+    else:
+        finetune(args, datasets, model, pretrained_path=args.pretrain output_dir = args.out_dir, output_prefix = args.prefix)
 
 if __name__ == '__main__':
     main()
