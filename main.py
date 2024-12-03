@@ -104,6 +104,176 @@ def train(
             torch.save(model.state_dict(), ckpt_path)
             print(f'saving checkpoint to {ckpt_path}')
 
+def finetune(
+    args,
+    datasets: CaptionsDataset,
+    model: ClipCaptionModel,
+    pretrained_path: str,
+    warmup_steps: int = 1000,
+    output_dir: str = '.',
+    output_prefix: str = ''
+):
+    """
+    Finetune a pre-trained ClipCaptionModel on new data.
+    
+    Args:
+        args: Training arguments and hyperparameters
+        datasets: Dataset for finetuning
+        model: ClipCaptionModel instance
+        pretrained_path: Path to pretrained model weights
+        warmup_steps: Number of warmup steps for learning rate scheduler
+        output_dir: Directory to save finetuned model checkpoints
+        output_prefix: Prefix for saved model files
+    """
+    device = args.device
+    batch_size = args.bs
+    epochs = args.epochs
+
+    # Create output directory if it doesn't exist
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Load pretrained weights
+    if os.path.exists(pretrained_path):
+        print(f"Loading pretrained model from {pretrained_path}")
+        state_dict = torch.load(pretrained_path, map_location=device)
+        model.load_state_dict(state_dict)
+    else:
+        raise FileNotFoundError(f"Pretrained model not found at {pretrained_path}")
+
+    # Move model to device and set to training mode
+    model = model.to(device)
+    model.train()
+
+    # Load CLIP encoder if not using pre-extracted features
+    if not args.using_clip_features:
+        encoder, _ = clip.load(args.clip_model, device=device)
+        encoder.eval()
+
+    # Setup optimizer with lower learning rate for finetuning
+    finetune_lr = args.lr * 0.1  # Lower learning rate for finetuning
+    optimizer = AdamW(model.parameters(), lr=finetune_lr)
+    
+    # Setup data loading
+    dataloader = DataLoader(
+        datasets, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        drop_last=True, 
+        num_workers=args.num_workers, 
+        collate_fn=collate
+    )
+    
+    tokenizer = dataloader.dataset.tokenizer
+    
+    # Setup learning rate scheduler
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=epochs * len(dataloader)
+    )
+    
+    # Setup gradient scaler for mixed precision training
+    scaler = torch.cuda.amp.GradScaler(enabled=args.use_amp)
+
+    best_loss = float('inf')
+    patience = args.patience if hasattr(args, 'patience') else 3
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        sys.stdout.flush()
+        print(f">>> Finetuning epoch {epoch}")
+        progress = tqdm(total=len(dataloader), desc=output_prefix)
+        epoch_loss = 0.0
+
+        for idx, (captions_clip, captions_gpt_tokens, captions_tokens_for_loss, masks, hard_prompts_length) in enumerate(dataloader):
+            model.zero_grad()
+
+            # Process CLIP features
+            if not args.using_clip_features:
+                with torch.no_grad():
+                    captions_clip_tokens = captions_clip.to(device)
+                    continuous_prefix = encoder.encode_text(captions_clip_tokens).float()
+            else:
+                continuous_prefix = captions_clip.to(device).float()
+
+            # Normalize and add noise to prefix
+            if args.normalize_prefix:
+                continuous_prefix /= continuous_prefix.norm(2, dim=-1, keepdim=True)
+            continuous_prefix = noise_injection(
+                continuous_prefix,
+                variance=args.noise_variance,
+                device=args.device
+            )
+
+            # Move tensors to device
+            captions_gpt_tokens = captions_gpt_tokens.to(device)
+            captions_tokens_for_loss = captions_tokens_for_loss.to(device)
+            masks = masks.to(device)
+
+            # Forward pass with mixed precision
+            with torch.cuda.amp.autocast(enabled=args.use_amp):
+                if args.using_hard_prompt:
+                    outputs = model(continuous_prefix, captions_gpt_tokens, hard_prompts_length, masks)
+                else:
+                    outputs = model(continuous_prefix, captions_gpt_tokens, mask=masks)
+                logits = outputs.logits
+
+            # Prepare targets and calculate loss
+            captions_tokens_for_loss = captions_tokens_for_loss.masked_fill(
+                captions_tokens_for_loss == tokenizer.eos_token_id, 0
+            )
+            loss = nnf.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                captions_tokens_for_loss.flatten(),
+                ignore_index=0
+            )
+
+            # Backward pass and optimization
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+
+            # Update progress
+            progress.set_postfix({"loss": loss.item()})
+            progress.update()
+            epoch_loss += loss.item()
+
+            # Log training progress
+            log_iters = len(dataloader)//5 if len(dataloader) > 5 else len(dataloader)
+            if (idx + 1) % log_iters == 0:
+                avg_loss = epoch_loss / log_iters
+                print(f'epoch {epoch}, iter {idx}, average finetune loss: {avg_loss:.4f}')
+                epoch_loss = 0.0
+
+        progress.close()
+        avg_epoch_loss = epoch_loss / len(dataloader)
+
+        # Save checkpoint if loss improved
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            patience_counter = 0
+            ckpt_path = os.path.join(output_dir, f"{output_prefix}_best.pt")
+            torch.save(model.state_dict(), ckpt_path)
+            print(f'Saving best model with loss {best_loss:.4f} to {ckpt_path}')
+        else:
+            patience_counter += 1
+
+        # Regular checkpoint saving
+        if (epoch + 1) % args.save_every == 0 or epoch == epochs - 1:
+            ckpt_path = os.path.join(output_dir, f"{output_prefix}-finetune-{epoch:03d}.pt")
+            torch.save(model.state_dict(), ckpt_path)
+            print(f'Saving checkpoint to {ckpt_path}')
+
+        # Early stopping
+        # if patience_counter >= patience:
+        #     print(f'Early stopping triggered after {patience} epochs without improvement')
+        #     break
+
+    return model
+
 def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
@@ -141,6 +311,7 @@ def main():
     parser.add_argument('--use_amp', action = 'store_true', default = False, help = "whether to use torch.amp to acclerate training")
     parser.add_argument('--disable_random_seed', action = 'store_true', default = False, help = 'set random seed for reproducing')
     parser.add_argument('--random_seed', type = int, default = 30, help = 'set random seed for reproducing')
+    parser.add_argument('--pretrain', default=None, help = 'set random seed for reproducing')
 
     args = parser.parse_args()
     print(f'args: {vars(args)}')
@@ -162,7 +333,10 @@ def main():
     else:
         model = ClipCaptionModel(args.continuous_prompt_length, args.clip_project_length, clip_hidden_size, args.num_layers, gpt_type = args.language_model, soft_prompt_first = args.soft_prompt_first, only_hard_prompt = args.only_hard_prompt)
     
-    train(args, datasets, model, output_dir = args.out_dir, output_prefix = args.prefix)
+    if args.pretrain == None:
+        train(args, datasets, model, output_dir = args.out_dir, output_prefix = args.prefix)
+    else:
+        finetune(args, datasets, model, pretrained_path=args.pretrain, output_dir = args.out_dir, output_prefix = args.prefix)
 
 if __name__ == '__main__':
     main()
